@@ -1,14 +1,16 @@
+import asyncio
 import json
-import threading
+# import threading
 import _thread
 import logging
 from ignition.service.framework import Capability, Service, interface
 from ignition.service.config import ConfigurationPropertiesGroup, ConfigurationProperties
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.admin import KafkaAdminClient, NewTopic
-from kafka.errors import BrokerResponseError, TopicAlreadyExistsError
+# from kafka import KafkaProducer, KafkaConsumer
+from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+from aiokafka.errors import BrokerResponseError, TopicAlreadyExistsError
 from signal import signal, SIGTERM
-
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+# from aiokafka.helpers import create_topics, delete_topics
 logger = logging.getLogger(__name__)
 
 ############################
@@ -71,22 +73,31 @@ class TopicConfigProperties(ConfigurationProperties):
 
 class TopicCreator:
 
-    def create_topic_if_needed(self, messaging_properties, topic_config_properties):
+    async def create_topic_if_needed(self, messaging_properties, topic_config_properties):
         if topic_config_properties.auto_create:
             # KafkaAdminClient is picky about which keyword arguments are passed in, so build the parameters from KafkaAdminClient.DEFAULT_CONFIG
-            config = {key:messaging_properties.config.get(key, None) for key in KafkaAdminClient.DEFAULT_CONFIG if messaging_properties.config.get(key, None) is not None }
+            config = {key:messaging_properties.config.get(key, None) for key in AIOKafkaAdminClient.DEFAULT_CONFIG if messaging_properties.config.get(key, None) is not None }
             config['bootstrap_servers'] = messaging_properties.connection_address
             config['client_id'] ='ignition'
-            admin_client = KafkaAdminClient(**config)
+            admin_client = AIOKafkaAdminClient(**config)
             try:
+                await admin_client.start()
                 logger.info("Creating topic {0} with replication factor {1}, partitions {2} and config {3}".format(topic_config_properties.name, topic_config_properties.replication_factor, topic_config_properties.num_partitions, topic_config_properties.config))
                 topic_list = [NewTopic(name=topic_config_properties.name, num_partitions=topic_config_properties.num_partitions, replication_factor=topic_config_properties.replication_factor, topic_configs=topic_config_properties.config)]
-                admin_client.create_topics(new_topics=topic_list, validate_only=False)
+                await admin_client.create_topics(new_topics=topic_list, validate_only=False)
+                # loop = asyncio.get_running_loop()
+                # # Run the synchronous KafkaAdminClient.create_topics method in a thread pool
+                # await loop.run_in_executor(
+                #     None,  # None uses the default executor (a ThreadPoolExecutor)
+                #     admin_client.create_topics,
+                #     topic_list,  # Arguments for the create_topics method
+                #     validate_only=False
+                # )
             except TopicAlreadyExistsError as _:
                 logger.info("Topic {0} already exists, not creating".format(topic_config_properties.name))
             finally:
                 try:
-                    admin_client.close()
+                    await admin_client.close()
                 except Exception as e:
                     logger.debug("Exception closing Kafka admin client {0}".format(str(e)))
         else:
@@ -194,6 +205,9 @@ class PostalService(Service, PostalCapability):
             logger.debug('Posting envelope to {0} with key: {1} and message: {2}'.format(envelope.address, key, envelope.message))
             self.delivery_service.deliver(envelope, key=key)
 
+
+
+
 class KafkaDeliveryService(Service, DeliveryCapability):
 
     def sigterm_handler(self, sig, frame):
@@ -214,15 +228,17 @@ class KafkaDeliveryService(Service, DeliveryCapability):
     def __lazy_init_producer(self):
         if self.producer is None:
             # KafkaProducer is picky about which keyword arguments are passed in, so build the parameters from KafkaProducer.DEFAULT_CONFIG
-            config = {key:self.messaging_config.get(key, None) for key in KafkaProducer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None}
+            config = {key:self.messaging_config.get(key, None) for key in AIOKafkaProducer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None}
+            # config = {key: value for key, value in self.messaging_config.items() if value is not None}
+            print("I am here with {}".format(config))
             config['bootstrap_servers'] = self.bootstrap_servers
             config['client_id'] = 'ignition'
-            self.producer = KafkaProducer(**config)
+            self.producer = AIOKafkaProducer(**config)
 
-    def __close_producer(self):
+    async def __close_producer(self):
         if self.producer is not None:
-            self.producer.flush()
-            self.producer.close()
+            await self.producer.flush()
+            await self.producer.stop()
 
     def __on_send_success(self, record_metadata):
         logger.debug('Envelope successfully posted to {0} on partition {1} and offset {2}'.format(record_metadata.topic, record_metadata.partition, record_metadata.offset))
@@ -230,7 +246,7 @@ class KafkaDeliveryService(Service, DeliveryCapability):
     def __on_send_error(self, excp):
         logger.error('Error sending envelope', exc_info=excp)
 
-    def deliver(self, envelope, key=None):
+    async def deliver(self, envelope, key=None):
         if envelope is None:
             raise ValueError('An envelope must be passed to deliver a message')
         self.__lazy_init_producer()
@@ -240,14 +256,17 @@ class KafkaDeliveryService(Service, DeliveryCapability):
             tenant_id = envelope.tenant_id
             headers = [('tenantId', envelope.tenant_id.encode('utf-8'))]
             if key is None:
-                self.producer.send(envelope.address, content, headers=headers).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+                await self.producer.send(envelope.address, content, headers=headers).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
             else:
-                self.producer.send(envelope.address, key=str.encode(key), value=content, headers=headers).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+                await self.producer.send(envelope.address, key=str.encode(key), value=content, headers=headers).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
         else:
             if key is None:
-                self.producer.send(envelope.address, content).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+                await self.producer.send(envelope.address, content).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
             else:
-                self.producer.send(envelope.address, key=str.encode(key), value=content).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+                await self.producer.send(envelope.address, key=str.encode(key), value=content).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+
+
+
 
 class KafkaInboxService(Service, InboxCapability):
 
@@ -259,68 +278,104 @@ class KafkaInboxService(Service, InboxCapability):
         messaging_properties = kwargs.get('messaging_properties')
         self.bootstrap_servers = messaging_properties.connection_address
         self.messaging_config = messaging_properties.config
+        # self.topic = messaging_properties.topic
         if self.bootstrap_servers is None:
             raise ValueError('connection_address not set on messaging_properties')
-        self.active_threads = []
+        self.active_consumers = []
 
-    def __thread_exit_func(self, thread, closing_error):
-        self.active_threads.remove(thread)
-        if closing_error:
-            if self.test_mode:
-                self.exited = True
-            else:
-                logger.error('Interrupting application due to error in inbox thread {0}: {1}'.format(thread.topic, str(closing_error)))
-                _thread.interrupt_main()
+    # def __consumer_exit_func(self, topic, closing_error):
+    #     self.active_consumers.remove(self.consumer)
+    #     if closing_error:
+    #         if self.test_mode:
+    #             self.exited = True
+    #         else:
+    #             logger.error('Interrupting application due to error in inbox thread {0}: {1}'.format(topic, str(closing_error)))
+    #             # _thread.interrupt_main()
 
-    def watch_inbox(self, group_id, address, read_func):
-        thread = KafkaInboxThread(self.bootstrap_servers, group_id, address, read_func, self.__thread_exit_func, self.messaging_config)
-        thread.setDaemon(True)
-        self.active_threads.append(thread)
-        try:
-            thread.start()
-        except Exception as _:
-            self.active_threads.remove(thread)
-
-
-class KafkaInboxThread(threading.Thread):
-
-    def __init__(self, bootstrap_servers, group_id, topic, consumer_func, thread_exit_func, messaging_config):
-        self.parent = threading.currentThread()
-        self.bootstrap_servers = bootstrap_servers
-        self.group_id = group_id
-        self.topic = topic
-        self.consumer_func = consumer_func
-        self.thread_exit_func = thread_exit_func
-        self.messaging_config = messaging_config
-
-        super().__init__()
-
-    def run(self):
+    async def watch_inbox(self, group_id, address, read_func):
+        # consumer = await KafkaInboxThread(self.bootstrap_servers, group_id, address, read_func, self.messaging_config)
+        # consumer.setDaemon(True)
         logger.info('Starting watch on inbox topic: {0}'.format(self.topic))
         closing_error = None
 
         # KafkaConsumer is picky about which keyword arguments are passed in, so build the parameters from KafkaProducer.DEFAULT_CONFIG
-        config = {key:self.messaging_config.get(key, None) for key in KafkaConsumer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None }
+        config = {key:self.messaging_config.get(key, None) for key in AIOKafkaConsumer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None }
+        # config = {key: value for key, value in self.messaging_config.items() if value is not None}
         config['bootstrap_servers'] = self.bootstrap_servers
         config['group_id'] = self.group_id
         config['enable_auto_commit'] = False
         config['client_id'] = 'ignition'
-        consumer = KafkaConsumer(self.topic, **config)
+        consumer = AIOKafkaConsumer(self.topic, **config)
+
+        print("checking_consumer {}".format(consumer))
+        self.active_consumers.append(consumer)
+        try:
+            await consumer.start()
+        except Exception as _:
+            self.active_consumers.remove(consumer)
 
         try:
-            for record in consumer:
+            async for record in consumer:
                 logger.debug('Inbox ({0}) has received a new message: Offset={1}, Partition={2}, Key={3}'.format(self.topic, record.offset, record.partition, record.key))
                 record_content = record.value.decode('utf-8')
-                self.consumer_func(record_content)
+                read_func(record_content)
                 # If consumer func returns without error we are ok to move on
-                consumer.commit()
+                await consumer.commit()
         except Exception as e:
             logger.exception('Inbox thread for topic {0} is closing due to error (see below):'.format(self.topic))
             closing_error = e
         finally:
             try:
-                consumer.close()
+                await consumer.stop()
+                print("inside_run_kafkainbox_thread")
             except Exception as e:
                 logger.exception('Error closing consumer for inbox thread on topic {0}'.format(self.topic))
-            finally:
-                self.thread_exit_func(self, closing_error)
+
+
+
+# class KafkaInboxThread():
+
+#     def __init__(self, bootstrap_servers, group_id, topic, consumer_func, consumer_exit_func, messaging_config):
+#         # self.parent = threading.currentThread()
+#         self.bootstrap_servers = bootstrap_servers
+#         self.group_id = group_id
+#         self.topic = topic
+#         self.consumer_func = consumer_func
+#         self.consumer_exit_func = consumer_exit_func
+#         self.messaging_config = messaging_config
+#         print("inside_init_kafkainbox thread")
+#         super().__init__()
+
+#     async def run(self):
+#         logger.info('Starting watch on inbox topic: {0}'.format(self.topic))
+#         closing_error = None
+
+#         # KafkaConsumer is picky about which keyword arguments are passed in, so build the parameters from KafkaProducer.DEFAULT_CONFIG
+#         config = {key:self.messaging_config.get(key, None) for key in AIOKafkaConsumer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None }
+#         # config = {key: value for key, value in self.messaging_config.items() if value is not None}
+#         config['bootstrap_servers'] = self.bootstrap_servers
+#         config['group_id'] = self.group_id
+#         config['enable_auto_commit'] = False
+#         config['client_id'] = 'ignition'
+#         consumer = AIOKafkaConsumer(self.topic, **config)
+
+#         try:
+#             async for record in consumer:
+#                 logger.debug('Inbox ({0}) has received a new message: Offset={1}, Partition={2}, Key={3}'.format(self.topic, record.offset, record.partition, record.key))
+#                 record_content = record.value.decode('utf-8')
+#                 self.consumer_func(record_content)
+#                 # If consumer func returns without error we are ok to move on
+#                 await consumer.commit()
+#         except Exception as e:
+#             logger.exception('Inbox thread for topic {0} is closing due to error (see below):'.format(self.topic))
+#             closing_error = e
+#         finally:
+#             try:
+#                 await consumer.close()
+#                 print("inside_run_kafkainbox_thread")
+#             except Exception as e:
+#                 logger.exception('Error closing consumer for inbox thread on topic {0}'.format(self.topic))
+#             finally:
+#                 self.consumer_exit_func(self, self.topic, closing_error)
+        
+

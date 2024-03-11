@@ -10,6 +10,7 @@ from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.errors import BrokerResponseError, TopicAlreadyExistsError
 from signal import signal, SIGTERM
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+
 # from aiokafka.helpers import create_topics, delete_topics
 logger = logging.getLogger(__name__)
 
@@ -225,14 +226,15 @@ class KafkaDeliveryService(Service, DeliveryCapability):
         self.producer = None
         signal(SIGTERM, self.sigterm_handler)
 
-    def __lazy_init_producer(self):
+    async def __lazy_init_producer(self):
         if self.producer is None:
             # KafkaProducer is picky about which keyword arguments are passed in, so build the parameters from KafkaProducer.DEFAULT_CONFIG
-            config = {key:self.messaging_config.get(key, None) for key in AIOKafkaProducer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None}
-            # config = {key: value for key, value in self.messaging_config.items() if value is not None}
+            # config = {key:self.messaging_config.get(key, None) for key in AIOKafkaProducer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None}
+            config = {key: value for key, value in self.messaging_config.items() if value is not None}
             print("I am here with {}".format(config))
             config['bootstrap_servers'] = self.bootstrap_servers
             config['client_id'] = 'ignition'
+            config.pop('api_version_auto_timeout_ms', None)
             self.producer = AIOKafkaProducer(**config)
 
     async def __close_producer(self):
@@ -246,24 +248,25 @@ class KafkaDeliveryService(Service, DeliveryCapability):
     def __on_send_error(self, excp):
         logger.error('Error sending envelope', exc_info=excp)
 
-    async def deliver(self, envelope, key=None):
+    def deliver(self, envelope, key=None):
         if envelope is None:
             raise ValueError('An envelope must be passed to deliver a message')
         self.__lazy_init_producer()
         content = envelope.message.content
+        print("insidedeliver")
         logger.debug('Delivering envelope to {0} with message content'.format(envelope.address))
         if(hasattr(envelope, 'tenant_id')):
             tenant_id = envelope.tenant_id
             headers = [('tenantId', envelope.tenant_id.encode('utf-8'))]
             if key is None:
-                await self.producer.send(envelope.address, content, headers=headers).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+                self.producer.send(envelope.address, content, headers=headers).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
             else:
-                await self.producer.send(envelope.address, key=str.encode(key), value=content, headers=headers).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+                self.producer.send(envelope.address, key=str.encode(key), value=content, headers=headers).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
         else:
             if key is None:
-                await self.producer.send(envelope.address, content).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+                self.producer.send(envelope.address, content).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
             else:
-                await self.producer.send(envelope.address, key=str.encode(key), value=content).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
+                self.producer.send(envelope.address, key=str.encode(key), value=content).add_callback(self.__on_send_success).add_errback(self.__on_send_error)
 
 
 

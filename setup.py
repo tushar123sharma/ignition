@@ -25,7 +25,7 @@ setup(
     install_requires=[
         'connexion==3.0.5',
         'kafka-python==2.0.2',
-        'aiokafka',
+        'aiokafka==0.10.0',
         'networkx==2.5.1',
         'frozendict==2.0.2',
         'Jinja2==3.0.1',

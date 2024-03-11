@@ -229,8 +229,8 @@ class KafkaDeliveryService(Service, DeliveryCapability):
     async def __lazy_init_producer(self):
         if self.producer is None:
             # KafkaProducer is picky about which keyword arguments are passed in, so build the parameters from KafkaProducer.DEFAULT_CONFIG
-            # config = {key:self.messaging_config.get(key, None) for key in AIOKafkaProducer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None}
-            config = {key: value for key, value in self.messaging_config.items() if value is not None}
+            config = {key:self.messaging_config.get(key, None) for key in AIOKafkaProducer.DEFAULT_CONFIG if self.messaging_config.get(key, None) is not None}
+            # config = {key: value for key, value in self.messaging_config.items() if value is not None}
             print("I am here with {}".format(config))
             config['bootstrap_servers'] = self.bootstrap_servers
             config['client_id'] = 'ignition'
